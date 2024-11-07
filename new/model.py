@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .features import ProteinFeatures
 
@@ -511,30 +512,38 @@ class ProteinMPNN(nn.Module):
         """
         device = X.device
 
-        # prepare node and edge embeddings
+        # embed edge features => [B, L, K, C] and neighbor indices => [B, L, K]
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
-        h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
-        h_E = self.W_e(E)
+        h_E = self.W_e(E)  # => [B, L, K, C]
+        # initialize node features => [B, L, C]
+        h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=device)
 
-        # encoder is unmasked self-attention
+        # embed the target sequence => [B, L, C]
+        h_S = self.W_s(S)
+
+        # create encoder mask => [B, L, K]
         mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
         mask_attend = mask.unsqueeze(-1) * mask_attend
+
+        # encoder
         for layer in self.encoder_layers:
             h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
 
-        # concatenate sequence embeddings for autoregressive decoder
-        h_S = self.W_s(S)
+        # concatenate sequence embeddings with edge features => [B, L, K, 2C]
         h_ES = cat_neighbors_nodes(h_S, h_E, E_idx)
 
-        # Build encoder embeddings
+        # concatenate target sequence embeddings with edge features => [B, L, K, 2C]
+        # but with zeros for the target sequence embeddings to keep the target hidden
         h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
+        # concatenate node features with the target/edge features => [B, L, K, 3C]
         h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
 
-        chain_M = chain_M * mask  # update chain_M to include missing regions
+        # update chain mask to include only regions specified by the mask
+        chain_M = chain_M * mask
         if not use_input_decoding_order:
-            decoding_order = torch.argsort(
-                (chain_M + 0.0001) * (torch.abs(randn))
-            )  # [numbers will be smaller for places where chain_M = 0.0 and higher for places where chain_M = 1.0]
+            # pseudo-randomly sort the chain mask in a way that ensures masked regions
+            # (i.e. where chain_M = 1.0) will come before unmasked regions
+            decoding_order = torch.argsort((chain_M + 0.0001) * (torch.abs(randn)))
         mask_size = E_idx.shape[1]
         permutation_matrix_reverse = torch.nn.functional.one_hot(
             decoding_order, num_classes=mask_size
