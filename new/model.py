@@ -7,6 +7,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from .features import ProteinFeatures
+
 
 def gather_edges(edges: torch.Tensor, neighbor_idx: torch.Tensor) -> torch.Tensor:
     """
@@ -347,3 +349,214 @@ class DecoderLayer(nn.Module):
             h_V = mask_V * h_V
 
         return h_V
+
+
+class ProteinMPNN(nn.Module):
+    """
+    ProteinMPNN model.
+    """
+
+    def __init__(
+        self,
+        num_letters: int,  # what's the difference between num_letters and vocab_size?
+        node_features: int,
+        edge_features: int,
+        hidden_dim: int,
+        num_encoder_layers: int = 3,
+        num_decoder_layers: int = 3,
+        vocab_size: int = 21,
+        k_neighbors: int = 64,
+        augment_eps: float = 0.05,
+        dropout: float = 0.1,
+        ca_only: bool = False,
+    ):
+        """
+        ProteinMPNN model.
+
+        Parameters
+        ----------
+        num_letters: int
+            Number of letters in the alphabet.
+
+        node_features: int
+            Number of node features.
+
+        edge_features: int
+            Number of edge features.
+
+        hidden_dim: int
+            Number of hidden features.
+
+        num_encoder_layers: int, default=3
+            Number of encoder layers.
+
+        num_decoder_layers: int, default=3
+            Number of decoder layers.
+
+        vocab: int, default=21
+            Number of vocabulary items.
+
+        k_neighbors: int, default=64
+            Number of neighbors.
+
+        augment_eps: float, default=0.05
+            Augmentation epsilon, used to add noise.
+
+        dropout: float, default=0.1
+            Dropout rate.
+
+        ca_only: bool, default=False
+            Whether to use only Ca features.
+
+        """
+        super(ProteinMPNN, self).__init__()
+
+        # Hyperparameters
+        self.node_features = node_features
+        self.edge_features = edge_features
+        self.hidden_dim = hidden_dim
+
+        # features
+        #
+        # NOTE: the actual ProteinMPNN code inverts node and edge features
+        # not sure whether that's a mistake or not, but probably doesn't matter since they're
+        # the same value by default (node_features == edge_features == hidden_dim)
+        #
+        # the node/edge inversion is also present in the original Ingraham 2019 code, see
+        # ProteinFeatures here: https://github.com/jingraham/neurips19-graph-protein-design/blob/22e497a2b565fe82f17e12ea37e89dcf4e50e92f/struct2seq/protein_features.py#L44
+        # and instanttiation in the model here: https://github.com/jingraham/neurips19-graph-protein-design/blob/22e497a2b565fe82f17e12ea37e89dcf4e50e92f/struct2seq/struct2seq.py#L28
+        self.features = ProteinFeatures(
+            edge_features=edge_features,
+            node_features=node_features,
+            top_k=k_neighbors,
+            augment_eps=augment_eps,
+            ca_only=ca_only,
+        )
+
+        self.W_e = nn.Linear(edge_features, hidden_dim, bias=True)
+        self.W_s = nn.Embedding(vocab_size, hidden_dim)
+        self.W_out = nn.Linear(hidden_dim, num_letters, bias=True)
+
+        # encoder layers
+        self.encoder_layers = nn.ModuleList(
+            [
+                EncoderLayer(hidden_dim, hidden_dim * 2, dropout=dropout)
+                for _ in range(num_encoder_layers)
+            ]
+        )
+
+        # decoder layers
+        self.decoder_layers = nn.ModuleList(
+            [
+                DecoderLayer(hidden_dim, hidden_dim * 3, dropout=dropout)
+                for _ in range(num_decoder_layers)
+            ]
+        )
+
+        # initialize weights
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(
+        self,
+        X: torch.Tensor,
+        S: torch.Tensor,
+        mask: torch.Tensor,
+        chain_M: torch.Tensor,
+        residue_idx: torch.Tensor,
+        chain_encoding_all: torch.Tensor,
+        randn: torch.Tensor,
+        use_input_decoding_order: bool = False,
+        decoding_order: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Parameters
+        ----------
+        X: torch.Tensor
+            Input node features with shape [B, L, C], where B is the batch size,
+            L is the sequence length, and C is the number of features.
+
+        S: torch.Tensor
+            Target sequence with shape [B, L].
+
+        mask: torch.Tensor
+            Mask with shape [B, L].
+
+        chain_M: torch.Tensor
+            Chain mask with shape [B, L].
+
+        residue_idx: torch.Tensor
+            Residue indices with shape [B, L].
+
+        chain_encoding_all: torch.Tensor
+            Chain encoding with shape [B, L, C].
+
+        randn: torch.Tensor
+            Random noise with shape [B, L].
+
+        use_input_decoding_order: bool, default=False
+            Whether to use input decoding order.
+
+        decoding_order: Optional[torch.Tensor], default=None
+            Decoding order with shape [B, L].
+
+        Returns
+        -------
+        log_probs: torch.Tensor
+            Log probabilities with shape [B, L, V], where V is the vocabulary size.
+
+        """
+        device = X.device
+
+        # prepare node and edge embeddings
+        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
+        h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
+        h_E = self.W_e(E)
+
+        # encoder is unmasked self-attention
+        mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
+        mask_attend = mask.unsqueeze(-1) * mask_attend
+        for layer in self.encoder_layers:
+            h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
+
+        # concatenate sequence embeddings for autoregressive decoder
+        h_S = self.W_s(S)
+        h_ES = cat_neighbors_nodes(h_S, h_E, E_idx)
+
+        # Build encoder embeddings
+        h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
+        h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
+
+        chain_M = chain_M * mask  # update chain_M to include missing regions
+        if not use_input_decoding_order:
+            decoding_order = torch.argsort(
+                (chain_M + 0.0001) * (torch.abs(randn))
+            )  # [numbers will be smaller for places where chain_M = 0.0 and higher for places where chain_M = 1.0]
+        mask_size = E_idx.shape[1]
+        permutation_matrix_reverse = torch.nn.functional.one_hot(
+            decoding_order, num_classes=mask_size
+        ).float()
+        order_mask_backward = torch.einsum(
+            "ij, biq, bjp->bqp",
+            (1 - torch.triu(torch.ones(mask_size, mask_size, device=device))),
+            permutation_matrix_reverse,
+            permutation_matrix_reverse,
+        )
+        mask_attend = torch.gather(order_mask_backward, 2, E_idx).unsqueeze(-1)
+        mask_1D = mask.view([mask.size(0), mask.size(1), 1, 1])
+        mask_bw = mask_1D * mask_attend
+        mask_fw = mask_1D * (1.0 - mask_attend)
+
+        h_EXV_encoder_fw = mask_fw * h_EXV_encoder
+        for layer in self.decoder_layers:
+            # Masked positions attend to encoder information, unmasked see.
+            h_ESV = cat_neighbors_nodes(h_V, h_ES, E_idx)
+            h_ESV = mask_bw * h_ESV + h_EXV_encoder_fw
+            h_V = layer(h_V, h_ESV, mask)
+
+        logits = self.W_out(h_V)
+        log_probs = F.log_softmax(logits, dim=-1)
+        return log_probs

@@ -837,11 +837,11 @@ def gather_nodes(nodes, neighbor_idx):
     return neighbor_features
 
 
-def gather_nodes_t(nodes, neighbor_idx):
-    # Features [B,N,C] at Neighbor index [B,K] => Neighbor features[B,K,C]
-    idx_flat = neighbor_idx.unsqueeze(-1).expand(-1, -1, nodes.size(2))
-    neighbor_features = torch.gather(nodes, 1, idx_flat)
-    return neighbor_features
+# def gather_nodes_t(nodes, neighbor_idx):
+#     # Features [B,N,C] at Neighbor index [B,K] => Neighbor features[B,K,C]
+#     idx_flat = neighbor_idx.unsqueeze(-1).expand(-1, -1, nodes.size(2))
+#     neighbor_features = torch.gather(nodes, 1, idx_flat)
+#     return neighbor_features
 
 
 def cat_neighbors_nodes(h_nodes, h_neighbors, E_idx):
