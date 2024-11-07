@@ -2,8 +2,9 @@
 # Distributed under the terms of the MIT License.
 # SPDX-License-Identifier: MIT
 
-from typing import Optional
+from typing import Dict, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -437,7 +438,6 @@ class ProteinMPNN(nn.Module):
         self.W_e = nn.Linear(edge_features, hidden_dim, bias=True)
         self.W_s = nn.Embedding(vocab_size, hidden_dim)
         self.W_out = nn.Linear(hidden_dim, num_letters, bias=True)
-
         # encoder layers
         self.encoder_layers = nn.ModuleList(
             [
@@ -445,7 +445,6 @@ class ProteinMPNN(nn.Module):
                 for _ in range(num_encoder_layers)
             ]
         )
-
         # decoder layers
         self.decoder_layers = nn.ModuleList(
             [
@@ -541,9 +540,164 @@ class ProteinMPNN(nn.Module):
         # update chain mask to include only regions specified by the mask
         chain_M = chain_M * mask
         if not use_input_decoding_order:
-            # pseudo-randomly sort the chain mask in a way that ensures masked regions
-            # (i.e. where chain_M = 1.0) will come before unmasked regions
+            # pseudo-randomly sort the chain mask in a way that ensures unmasked regions
+            # (where chain_M = 0.0) will come before masked regions => [B, L]
             decoding_order = torch.argsort((chain_M + 0.0001) * (torch.abs(randn)))
+        mask_size = E_idx.shape[1]
+
+        # create a matrix where each row is a one-hot encoding of the decoding order => [B, L, L]
+        permutation_matrix_reverse = torch.nn.functional.one_hot(
+            decoding_order, num_classes=mask_size
+        ).float()
+
+        # create a lower triangular matrix where the diagonal is 1.0 and the rest is 0.0 => [L, L]
+        lower_triangular = 1 - torch.triu(
+            torch.ones(mask_size, mask_size, device=device)
+        )
+        # expand the lower triangular matrix to match the shape of the permutation matrix => [B, L, L]
+        order_mask_backward = lower_triangular.unsqueeze(0).expand(
+            permutation_matrix_reverse.size(0), -1, -1
+        )
+
+        # use the order mask to get mask values for neighbors => [B, L, K, 1]
+        mask_attend = torch.gather(order_mask_backward, 2, E_idx).unsqueeze(-1)
+        # create a 1D mask => [B, L, 1, 1]
+        mask_1D = mask.view([mask.size(0), mask.size(1), 1, 1])
+        # create masks to allow non-autoregressive decoding => [B, L, K, 1]
+        # masks ensure that positions attend only to positions that precede them in the decoding order
+        mask_bw = mask_1D * mask_attend
+        mask_fw = mask_1D * (1.0 - mask_attend)
+
+        # use the sequence values from h_EXV_encoder (which is all zeros) for
+        # positions that follow the current position in the decoding order
+        h_EXV_encoder_fw = mask_fw * h_EXV_encoder  # => [B, L, K, 3C]
+        for layer in self.decoder_layers:
+            # concatenate node features with the target/edge features => [B, L, K, 3C]
+            # NOTE: h_ESV is similar to h_EXV, but includes the target sequence embeddings
+            # (h_EXV has zeros for sequence embeddings)
+            h_ESV = cat_neighbors_nodes(h_V, h_ES, E_idx)
+            # mask everything for positions that follow the current position in the decoding order
+            # then add back structure information from the encoder (but not sequende information)
+            h_ESV = mask_bw * h_ESV + h_EXV_encoder_fw
+            h_V = layer(h_V, h_ESV, mask)
+
+        logits = self.W_out(h_V)
+        log_probs = F.log_softmax(logits, dim=-1)
+        return log_probs
+
+    def sample(
+        self,
+        X: torch.Tensor,
+        randn: torch.Tensor,
+        S_true: torch.Tensor,
+        chain_mask: torch.Tensor,
+        chain_encoding_all: torch.Tensor,
+        residue_idx: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+        omit_AAs_np: Optional[np.ndarray] = None,
+        bias_AAs_np: Optional[np.ndarray] = None,
+        chain_M_pos: Optional[torch.Tensor] = None,
+        omit_AA_mask: Optional[torch.Tensor] = None,
+        pssm_coef: Optional[torch.Tensor] = None,
+        pssm_bias: Optional[torch.Tensor] = None,
+        pssm_multi: Optional[float] = None,
+        pssm_log_odds_flag: Optional[bool] = None,
+        pssm_log_odds_mask: Optional[torch.Tensor] = None,
+        pssm_bias_flag: Optional[bool] = None,
+        bias_by_res: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Sample from the model.
+
+        Parameters
+        ----------
+        X: torch.Tensor
+            Input node features with shape [B, L, C], where B is the batch size,
+            L is the sequence length, and C is the number of features.
+
+        randn: torch.Tensor
+            Random noise with shape [B, L].
+
+        S_true: torch.Tensor
+            Target sequence with shape [B, L].
+
+        chain_mask: torch.Tensor
+            Chain mask with shape [B, L].
+
+        chain_encoding_all: torch.Tensor
+            Chain encoding with shape [B, L, C].
+
+        residue_idx: torch.Tensor
+            Residue indices with shape [B, L].
+
+        mask: Optional[torch.Tensor], default=None
+            Mask with shape [B, L].
+
+        temperature: float, default=1.0
+            Sampling temperature.
+
+        omit_AAs_np: Optional[np.ndarray], default=None
+            Omit AAs numpy array.
+
+        bias_AAs_np: Optional[np.ndarray], default=None
+            Bias AAs numpy array.
+
+        chain_M_pos: Optional[torch.Tensor], default=None
+            Chain M position with shape [B, L].
+
+        omit_AA_mask: Optional[torch.Tensor], default=None
+            Omit AA mask with shape [B, L, 21].
+
+        pssm_coef: Optional[torch.Tensor], default=None
+            PSSM coefficient with shape [B, L, 21].
+
+        pssm_bias: Optional[torch.Tensor], default=None
+            PSSM bias with shape [B, L, 21].
+
+        pssm_multi: Optional[float], default=None
+            PSSM multiplier.
+
+        pssm_log_odds_flag: Optional[bool], default=None
+            PSSM log odds flag.
+
+        pssm_log_odds_mask: Optional[torch.Tensor], default=None
+            PSSM log odds mask with shape [B, L, 21].
+
+        pssm_bias_flag: Optional[bool], default=None
+            PSSM bias flag.
+
+        bias_by_res: Optional[torch.Tensor], default=None
+            Bias by residue with shape [B, L, 21].
+
+        Returns
+        -------
+        Dict[str, torch.Tensor]
+            Dictionary with keys "S", "probs", and "decoding_order".
+
+        """
+        device = X.device
+
+        # embed edge features => [B, L, K, C] and neighbor indices => [B, L, K]
+        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
+        h_E = self.W_e(E)
+
+        # initialize node features => [B, L, C]
+        h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=device)
+
+        # Encoder is unmasked self-attention
+        mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
+        mask_attend = mask.unsqueeze(-1) * mask_attend
+        for layer in self.encoder_layers:
+            h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
+
+        # Decoder uses masked self-attention
+        chain_mask = (
+            chain_mask * chain_M_pos * mask
+        )  # update chain_M to include missing regions
+        decoding_order = torch.argsort(
+            (chain_mask + 0.0001) * (torch.abs(randn))
+        )  # [numbers will be smaller for places where chain_M = 0.0 and higher for places where chain_M = 1.0]
         mask_size = E_idx.shape[1]
         permutation_matrix_reverse = torch.nn.functional.one_hot(
             decoding_order, num_classes=mask_size
@@ -559,13 +713,142 @@ class ProteinMPNN(nn.Module):
         mask_bw = mask_1D * mask_attend
         mask_fw = mask_1D * (1.0 - mask_attend)
 
-        h_EXV_encoder_fw = mask_fw * h_EXV_encoder
-        for layer in self.decoder_layers:
-            # Masked positions attend to encoder information, unmasked see.
-            h_ESV = cat_neighbors_nodes(h_V, h_ES, E_idx)
-            h_ESV = mask_bw * h_ESV + h_EXV_encoder_fw
-            h_V = layer(h_V, h_ESV, mask)
+        N_batch, N_nodes = X.size(0), X.size(1)
+        log_probs = torch.zeros((N_batch, N_nodes, 21), device=device)
+        all_probs = torch.zeros(
+            (N_batch, N_nodes, 21), device=device, dtype=torch.float32
+        )
+        h_S = torch.zeros_like(h_V, device=device)
+        S = torch.zeros((N_batch, N_nodes), dtype=torch.int64, device=device)
+        h_V_stack = [h_V] + [
+            torch.zeros_like(h_V, device=device)
+            for _ in range(len(self.decoder_layers))
+        ]
+        constant = torch.tensor(omit_AAs_np, device=device)
+        constant_bias = torch.tensor(bias_AAs_np, device=device)
+        # chain_mask_combined = chain_mask*chain_M_pos
+        omit_AA_mask_flag = omit_AA_mask != None
 
-        logits = self.W_out(h_V)
-        log_probs = F.log_softmax(logits, dim=-1)
-        return log_probs
+        h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
+        h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
+        h_EXV_encoder_fw = mask_fw * h_EXV_encoder
+        for t_ in range(N_nodes):
+            t = decoding_order[:, t_]  # [B]
+            chain_mask_gathered = torch.gather(chain_mask, 1, t[:, None])  # [B]
+            mask_gathered = torch.gather(mask, 1, t[:, None])  # [B]
+            bias_by_res_gathered = torch.gather(
+                bias_by_res, 1, t[:, None, None].repeat(1, 1, 21)
+            )[:, 0, :]  # [B, 21]
+            if (mask_gathered == 0).all():  # for padded or missing regions only
+                S_t = torch.gather(S_true, 1, t[:, None])
+            else:
+                # Hidden layers
+                E_idx_t = torch.gather(
+                    E_idx, 1, t[:, None, None].repeat(1, 1, E_idx.shape[-1])
+                )
+                h_E_t = torch.gather(
+                    h_E,
+                    1,
+                    t[:, None, None, None].repeat(1, 1, h_E.shape[-2], h_E.shape[-1]),
+                )
+                h_ES_t = cat_neighbors_nodes(h_S, h_E_t, E_idx_t)
+                h_EXV_encoder_t = torch.gather(
+                    h_EXV_encoder_fw,
+                    1,
+                    t[:, None, None, None].repeat(
+                        1, 1, h_EXV_encoder_fw.shape[-2], h_EXV_encoder_fw.shape[-1]
+                    ),
+                )
+                mask_t = torch.gather(mask, 1, t[:, None])
+                for l, layer in enumerate(self.decoder_layers):
+                    # Updated relational features for future states
+                    h_ESV_decoder_t = cat_neighbors_nodes(h_V_stack[l], h_ES_t, E_idx_t)
+                    h_V_t = torch.gather(
+                        h_V_stack[l],
+                        1,
+                        t[:, None, None].repeat(1, 1, h_V_stack[l].shape[-1]),
+                    )
+                    h_ESV_t = (
+                        torch.gather(
+                            mask_bw,
+                            1,
+                            t[:, None, None, None].repeat(
+                                1, 1, mask_bw.shape[-2], mask_bw.shape[-1]
+                            ),
+                        )
+                        * h_ESV_decoder_t
+                        + h_EXV_encoder_t
+                    )
+                    h_V_stack[l + 1].scatter_(
+                        1,
+                        t[:, None, None].repeat(1, 1, h_V.shape[-1]),
+                        layer(h_V_t, h_ESV_t, mask_V=mask_t),
+                    )
+                # Sampling step
+                h_V_t = torch.gather(
+                    h_V_stack[-1],
+                    1,
+                    t[:, None, None].repeat(1, 1, h_V_stack[-1].shape[-1]),
+                )[:, 0]
+                logits = self.W_out(h_V_t) / temperature
+                probs = F.softmax(
+                    logits
+                    - constant[None, :] * 1e8
+                    + constant_bias[None, :] / temperature
+                    + bias_by_res_gathered / temperature,
+                    dim=-1,
+                )
+                if pssm_bias_flag:
+                    pssm_coef_gathered = torch.gather(pssm_coef, 1, t[:, None])[:, 0]
+                    pssm_bias_gathered = torch.gather(
+                        pssm_bias, 1, t[:, None, None].repeat(1, 1, pssm_bias.shape[-1])
+                    )[:, 0]
+                    probs = (
+                        1 - pssm_multi * pssm_coef_gathered[:, None]
+                    ) * probs + pssm_multi * pssm_coef_gathered[
+                        :, None
+                    ] * pssm_bias_gathered
+                if pssm_log_odds_flag:
+                    pssm_log_odds_mask_gathered = torch.gather(
+                        pssm_log_odds_mask,
+                        1,
+                        t[:, None, None].repeat(1, 1, pssm_log_odds_mask.shape[-1]),
+                    )[:, 0]  # [B, 21]
+                    probs_masked = probs * pssm_log_odds_mask_gathered
+                    probs_masked += probs * 0.001
+                    probs = probs_masked / torch.sum(
+                        probs_masked, dim=-1, keepdim=True
+                    )  # [B, 21]
+                if omit_AA_mask_flag:
+                    omit_AA_mask_gathered = torch.gather(
+                        omit_AA_mask,
+                        1,
+                        t[:, None, None].repeat(1, 1, omit_AA_mask.shape[-1]),
+                    )[:, 0]  # [B, 21]
+                    probs_masked = probs * (1.0 - omit_AA_mask_gathered)
+                    probs = probs_masked / torch.sum(
+                        probs_masked, dim=-1, keepdim=True
+                    )  # [B, 21]
+                S_t = torch.multinomial(probs, 1)
+                all_probs.scatter_(
+                    1,
+                    t[:, None, None].repeat(1, 1, 21),
+                    (
+                        chain_mask_gathered[
+                            :,
+                            :,
+                            None,
+                        ]
+                        * probs[:, None, :]
+                    ).float(),
+                )
+            S_true_gathered = torch.gather(S_true, 1, t[:, None])
+            S_t = (
+                S_t * chain_mask_gathered
+                + S_true_gathered * (1.0 - chain_mask_gathered)
+            ).long()
+            temp1 = self.W_s(S_t)
+            h_S.scatter_(1, t[:, None, None].repeat(1, 1, temp1.shape[-1]), temp1)
+            S.scatter_(1, t[:, None], S_t)
+        output_dict = {"S": S, "probs": all_probs, "decoding_order": decoding_order}
+        return output_dict

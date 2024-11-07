@@ -1371,6 +1371,8 @@ class ProteinMPNN(nn.Module):
         permutation_matrix_reverse = torch.nn.functional.one_hot(
             decoding_order, num_classes=mask_size
         ).float()
+
+        # create a lower triangular matrix where the diagonal is 1.0 and the rest is 0.0
         order_mask_backward = torch.einsum(
             "ij, biq, bjp->bqp",
             (1 - torch.triu(torch.ones(mask_size, mask_size, device=device))),
